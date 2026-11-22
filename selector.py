@@ -19,6 +19,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER_MS = 2000
 STRUCT_KW = {"if", "elif", "else", "for", "while", "try", "except", "finally", "with", "def", "class", "match", "case", "async"}
 ROOT_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py", "tests/conftest.py", "tests/__init__.py", "tests/dialects/__init__.py", "MANIFEST.in"}
+SAFE_STDLIB = {
+    "os", "sys", "re", "json", "math", "itertools", "functools", "collections", "typing", "datetime", "logging",
+    "abc", "enum", "dataclasses", "copy", "random", "string", "time", "operator", "heapq", "bisect", "decimal",
+    "fractions", "numbers", "pathlib", "contextlib", "warnings", "textwrap", "types", "weakref", "inspect",
+    "importlib", "threading", "uuid", "hashlib", "base64", "struct", "io", "shutil", "tempfile", "statistics",
+    "pprint", "csv", "zlib", "gzip", "pickle", "traceback", "argparse", "colorsys", "array", "queue", "glob",
+    "fnmatch", "platform", "calendar", "difflib", "ast", "keyword", "linecache", "gc", "errno", "stat", "codecs",
+    "unicodedata", "html", "urllib", "secrets", "reprlib", "string", "token", "tokenize", "dis",
+}
 ENUMERATING_TESTS = {"tests/test_typing.py", "tests/test_sqlglotc.py", "tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py", "tests/dialects/test_dialect.py"}
 HARMLESS_EXT = (".md", ".png", ".jpg", ".svg", ".txt", ".rst", ".yml", ".yaml", ".lock", ".gitignore")
 
@@ -441,7 +450,20 @@ def tests_exec_mask(C, rel):
     return m
 
 
-def import_time(C, rel, cls):
+def const_masked_dump(node):
+    """Dump with every constant blanked: equal dumps mean only literal values
+    differ, so the statement cannot start raising when the module is imported."""
+    import copy
+
+    n = copy.deepcopy(node)
+    for x in ast.walk(n):
+        if isinstance(x, ast.Constant):
+            x.value = 0
+            x.kind = None
+    return ast.dump(n)
+
+
+def import_time(C, rel, cls, literal_only=False):
     """A change that runs at import (module or class level) of `rel`."""
     M = C.M
     mod = M["modof"].get(rel)
@@ -451,7 +473,9 @@ def import_time(C, rel, cls):
     if mod is None:
         return C.ALL
     if imp == C.ALLF:
-        if rel.startswith("sqlglot/expressions/") and cls and "." not in cls and cls in C.info(rel).classes:
+        # only a change of literal values is narrowed to the tests that build
+        # the class: anything else could make importing sqlglot itself fail
+        if literal_only and rel.startswith("sqlglot/expressions/") and cls and "." not in cls and cls in C.info(rel).classes:
             names = {cls}
             keys = {mod + ":" + cls}
             stack = [cls]
@@ -476,6 +500,7 @@ def import_time(C, rel, cls):
     seen = {mod}
     stack = [mod]
     m = 0
+    fm = 0
     while stack:
         cm = stack.pop()
         r = mod2rel.get(cm)
@@ -484,6 +509,10 @@ def import_time(C, rel, cls):
             m |= tests_exec_mask(C, r)
         else:
             m |= module_exec_mask(C, r)
+        # test files that import the module while being collected or set up:
+        # if the change makes the import raise, every test in them fails
+        for e in C.cov(r)[0].values():
+            fm |= e[2]
         for nx in C.rev_imports.get(cm, ()):
             if nx in seen:
                 continue
@@ -496,7 +525,7 @@ def import_time(C, rel, cls):
                 continue
             seen.add(nx)
             stack.append(nx)
-    return m
+    return m | C.files(fm)
 
 
 COOKIE_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
@@ -692,11 +721,13 @@ def analyze_py(C, rel, fd):
             else:
                 cls = q if kind == "c" else None
                 handled = False
+                lit_only = False
                 if one_to_one:
                     obody = oi.classes[q].body if kind == "c" else oi.tree.body
                     nbody = (ni.classes[q].body if q in ni.classes else None) if kind == "c" else ni.tree.body
                     if nbody is not None:
                         handled = True
+                        lit_only = True
                         m2 = 0
                         for a, b, uk in zip(rem, add, ounits):
                             if uk != (kind, q):
@@ -705,6 +736,7 @@ def analyze_py(C, rel, fd):
                             ns_ = find_level_stmt_deep(nbody, b)
                             if os_ is None or ns_ is None:
                                 handled = False
+                                lit_only = False
                                 break
                             if ast.dump(os_) == ast.dump(ns_):
                                 continue
@@ -712,6 +744,8 @@ def analyze_py(C, rel, fd):
                             nd, nl = masked_dump(ns_)
                             if od != nd or len(ol) != len(nl):
                                 handled = False
+                                if const_masked_dump(os_) != const_masked_dump(ns_):
+                                    lit_only = False
                                 break
                             for x, y in zip(ol, nl):
                                 if ast.dump(x) != ast.dump(y):
@@ -721,7 +755,7 @@ def analyze_py(C, rel, fd):
                 if not handled:
                     if level_equal(oi, ni, kind, q):
                         continue
-                    mask |= import_time(C, rel, cls)
+                    mask |= import_time(C, rel, cls, literal_only=one_to_one and lit_only)
     return mask
 
 
@@ -804,11 +838,11 @@ def unused_additions(C, rel, old_text, ni, add_lines):
         names = []
         if isinstance(st, ast.Import):
             for al in st.names:
-                if al.name.split(".")[0] not in sys.stdlib_module_names:
+                if al.name.split(".")[0] not in SAFE_STDLIB:
                     return False
                 names.append((al.asname or al.name).split(".")[0])
         elif isinstance(st, ast.ImportFrom):
-            if st.level or (st.module or "").split(".")[0] not in sys.stdlib_module_names or st.module == "__future__":
+            if st.level or (st.module or "").split(".")[0] not in SAFE_STDLIB:
                 return False
             for al in st.names:
                 if al.name == "*":
