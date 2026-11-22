@@ -499,6 +499,64 @@ def import_time(C, rel, cls):
     return m
 
 
+COOKIE_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def coding_cookie(lines):
+    for l in lines[:2]:
+        m = COOKIE_RE.match(l)
+        if m:
+            return m.group(1).lower().replace("_", "-")
+    return None
+
+
+def has_future_annotations(tree):
+    for st in tree.body:
+        if isinstance(st, ast.ImportFrom) and st.module == "__future__" and any(a.name == "annotations" for a in st.names):
+            return True
+    return False
+
+
+def is_str_stmt(st):
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def norm_fn_dump(fn, strip_ann):
+    """Dump of a function without docstrings and other bare string statements,
+    and, when annotations are never evaluated (the module has the __future__
+    import), without parameter and return annotations. Nothing in sqlglot or
+    its tests reads docstrings or annotations at run time."""
+    import copy
+
+    f = copy.deepcopy(fn)
+    for node in ast.walk(f):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
+            nb = [st for st in body if not is_str_stmt(st)]
+            node.body = nb or [ast.Pass()]
+        if strip_ann:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                node.returns = None
+            elif isinstance(node, ast.arg):
+                node.annotation = None
+    return ast.dump(f)
+
+
+PLAIN_DECORATORS = {"property", "staticmethod", "classmethod", "abstractmethod", "overload"}
+
+
+def plain_decorators(fn):
+    """No decorator, here or on a nested function, that could read annotations
+    (functools.singledispatch registers by them)."""
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in node.decorator_list:
+                name = d.attr if isinstance(d, ast.Attribute) else getattr(d, "id", None)
+                if name not in PLAIN_DECORATORS:
+                    return False
+    return True
+
+
 def fn_sig(fn):
     names = set()
     special = 0
@@ -528,8 +586,14 @@ def analyze_py(C, rel, fd):
     if not blocks:
         return 0
     try:
+        if coding_cookie(new_lines) != coding_cookie(old_lines):
+            # a PEP 263 line changes how the whole file is decoded
+            raise ValueError("coding cookie changed")
         new_tree = ast.parse("\n".join(new_lines))
-    except (SyntaxError, ValueError):
+        # the parser alone accepts a misplaced __future__ import, a return
+        # outside a function, a break outside a loop, duplicate arguments
+        compile(new_tree, rel, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, TypeError):
         # the module no longer imports: every user fails, and so does every
         # test file that imports it while being collected or set up
         imp = C.M["imp_files"].get(rel, 0)
@@ -545,6 +609,7 @@ def analyze_py(C, rel, fd):
     ni = Info(new_tree)
     mask = 0
     fstate = {}
+    strip_ann = has_future_annotations(oi.tree) and has_future_annotations(new_tree)
     all_rem = [L for rem, add, pos in blocks for L in rem]
     all_add = [L for rem, add, pos in blocks for L in add]
     if not any(is_code(old_lines[L - 1]) for L in all_rem) and rel.startswith("sqlglot/"):
@@ -577,7 +642,7 @@ def analyze_py(C, rel, fd):
                 if of is None or nf is None:
                     cls = q.rpartition(".")[0]
                     nm = q.rpartition(".")[2].split("#")[0]
-                    if rel.startswith("tests/") and nm.startswith("test") and of is None:
+                    if rel.startswith("tests/") and nm.startswith("test") and of is None and (cls + "." + nm if cls else nm) not in oi.funcs:
                         continue
                     if of is not None:
                         mask |= body_lines_mask(C, rel, of)[0]
@@ -586,6 +651,9 @@ def analyze_py(C, rel, fd):
                 st = fstate.get(q)
                 if st is None:
                     same = ast.dump(of) == ast.dump(nf)
+                    if not same:
+                        sa = strip_ann and plain_decorators(of) and plain_decorators(nf)
+                        same = norm_fn_dump(of, sa) == norm_fn_dump(nf, sa)
                     deco = [ast.dump(d) for d in of.decorator_list] != [ast.dump(d) for d in nf.decorator_list]
                     hdr = deco or ast.dump(of.args) != ast.dump(nf.args) or of.name != nf.name or type(of) is not type(nf)
                     sig = same or fn_sig(of) == fn_sig(nf)
@@ -682,7 +750,7 @@ def skeleton(body):
         if run:
             out.append(tuple(sorted(run)))
             run = []
-        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) or is_str_stmt(st):
             continue
         if isinstance(st, ast.ClassDef):
             out.append("class %s %s" % (st.name, [ast.dump(b) for b in st.bases]))
@@ -782,7 +850,7 @@ def analyze_file(C, fd):
             return fixture_mask(C, rel)
         return C.ALL
     base = rel.rsplit("/", 1)[-1]
-    if rel in ROOT_CONFIG or base == "conftest.py":
+    if rel in ROOT_CONFIG or base in ("conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"):
         return C.ALL
     if rel.startswith("tests/fixtures/"):
         return fixture_mask(C, rel)
