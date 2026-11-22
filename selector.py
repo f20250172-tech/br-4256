@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER_MS = 2000
 STRUCT_KW = {"if", "elif", "else", "for", "while", "try", "except", "finally", "with", "def", "class", "match", "case", "async"}
 ROOT_CONFIG = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py", "tests/conftest.py", "tests/__init__.py", "tests/dialects/__init__.py", "MANIFEST.in"}
+ENUMERATING_TESTS = {"tests/test_typing.py", "tests/test_sqlglotc.py", "tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py", "tests/dialects/test_dialect.py"}
 HARMLESS_EXT = (".md", ".png", ".jpg", ".svg", ".txt", ".rst", ".yml", ".yaml", ".lock", ".gitignore")
 
 
@@ -71,20 +72,32 @@ class Ctx:
                 c = ({}, [])
             else:
                 lines, masks = pickle.loads(zlib.decompress(blob))
-                c = ({ln: (mi, fm) for ln, mi, fm in lines}, masks)
+                c = ({t[0]: t[1:] for t in lines}, masks)
             self._cov[rel] = c
         return c
 
-    def line_mask(self, rel, lo, hi, with_files=True):
+    def line_mask(self, rel, lo, hi, with_files=True, lam=False):
+        """Tests reaching any of the lines, plus the lines' flags.
+
+        A line that also runs at import is charged, in a cold run, to whichever
+        test happened to trigger the import; for such lines only the runs made
+        with every module already imported are used, and the caller adds the
+        users of the module instead."""
         d, masks = self.cov(rel)
         m = 0
+        flag = 0
+        core = self.M["imp_files"].get(rel, 0) == self.ALLF
         for ln in range(lo, hi + 1):
             e = d.get(ln)
             if e is not None:
                 m |= masks[e[0]]
-                if with_files and e[1]:
-                    m |= self.files(e[1])
-        return m
+                if not lam:
+                    if core or not e[3] & 2:
+                        m |= masks[e[1]]
+                    flag |= e[3]
+                    if with_files and e[2]:
+                        m |= self.files(e[2])
+        return m, flag
 
     def src(self, rel):
         s = self._src.get(rel)
@@ -398,16 +411,14 @@ def module_exec_mask(C, rel):
         return 0
     info = C.info(rel)
     d, masks = C.cov(rel)
-    m = 0
-    for ln, (mi, fm) in d.items():
-        m |= masks[mi]
+    m = tests_exec_mask(C, rel)
     for q, fn in info.funcs.items():
         first = stmt_start(fn.body[0])
         if first > fn.lineno:
             for ln in range(first, fn.end_lineno + 1):
                 e = d.get(ln)
-                if e is not None and e[1]:
-                    m |= C.files(e[1])
+                if e is not None and e[2]:
+                    m |= C.files(e[2])
     return m
 
 
@@ -421,7 +432,11 @@ def is_family(C, rel):
 def tests_exec_mask(C, rel):
     d, masks = C.cov(rel)
     m = 0
-    for mi in {e[0] for e in d.values()}:
+    seen = set()
+    for e in d.values():
+        seen.add(e[0])
+        seen.add(e[1])
+    for mi in seen:
         m |= masks[mi]
     return m
 
@@ -515,14 +530,27 @@ def analyze_py(C, rel, fd):
     try:
         new_tree = ast.parse("\n".join(new_lines))
     except (SyntaxError, ValueError):
+        # the module no longer imports: every user fails, and so does every
+        # test file that imports it while being collected or set up
         imp = C.M["imp_files"].get(rel, 0)
         if rel.startswith("tests/"):
             return C.files(imp)
-        return C.ALL if imp == C.ALLF else (import_time(C, rel, None) | C.files(imp))
+        if imp == C.ALLF:
+            return C.ALL
+        fm = 0
+        for e in C.cov(rel)[0].values():
+            fm |= e[2]
+        return import_time(C, rel, None) | C.files(fm)
     oi = C.info(rel)
     ni = Info(new_tree)
     mask = 0
     fstate = {}
+    all_rem = [L for rem, add, pos in blocks for L in rem]
+    all_add = [L for rem, add, pos in blocks for L in add]
+    if not any(is_code(old_lines[L - 1]) for L in all_rem) and rel.startswith("sqlglot/"):
+        if all(unit_key(ni.unit_at(L))[0] != "c" for L in all_add) and unused_additions(C, rel, old_text, ni, all_add):
+            if skeleton_minus(oi, ni, all_add):
+                return 0
     for rem, add, pos in blocks:
         ounits = [unit_key(oi.unit_at(L)) for L in rem]
         nunits = [unit_key(ni.unit_at(L)) for L in add]
@@ -552,7 +580,7 @@ def analyze_py(C, rel, fd):
                     if rel.startswith("tests/") and nm.startswith("test") and of is None:
                         continue
                     if of is not None:
-                        mask |= body_lines_mask(C, rel, of)
+                        mask |= body_lines_mask(C, rel, of)[0]
                     mask |= import_time(C, rel, cls or None)
                     continue
                 st = fstate.get(q)
@@ -567,24 +595,32 @@ def analyze_py(C, rel, fd):
                     continue
                 if deco:
                     mask |= import_time(C, rel, q.rpartition(".")[0] or None)
-                if hdr or not sig or not one_to_one:
-                    mask |= body_lines_mask(C, rel, of)
-                    continue
-                ok = True
+                ok = not (hdr or not sig or not one_to_one)
                 m2 = 0
-                first_body = stmt_start(of.body[0])
-                for L, uk in zip(rem, ounits):
-                    if uk != (kind, q):
-                        continue
-                    if L < first_body:
-                        ok = False
-                        break
-                    sp = stmt_span(of.body, L)
-                    if sp is None:
-                        ok = False
-                        break
-                    m2 |= C.line_mask(rel, sp[0], sp[1])
-                mask |= m2 if ok else body_lines_mask(C, rel, of)
+                fl = 0
+                if ok:
+                    first_body = stmt_start(of.body[0])
+                    for L, uk in zip(rem, ounits):
+                        if uk != (kind, q):
+                            continue
+                        if L < first_body:
+                            ok = False
+                            break
+                        sp = stmt_span(of.body, L)
+                        if sp is None:
+                            ok = False
+                            break
+                        mm, ff = C.line_mask(rel, sp[0], sp[1])
+                        m2 |= mm
+                        fl |= ff
+                if not ok:
+                    m2, fl = body_lines_mask(C, rel, of)
+                mask |= m2
+                if fl & 1 or (fl & 2 and C.M["imp_files"].get(rel, 0) != C.ALLF):
+                    # reached only on first use, or run while a lazily imported
+                    # module is being imported: every user of the module or
+                    # class can see the change
+                    mask |= import_time(C, rel, q.rpartition(".")[0] or None)
             else:
                 cls = q if kind == "c" else None
                 handled = False
@@ -611,7 +647,7 @@ def analyze_py(C, rel, fd):
                                 break
                             for x, y in zip(ol, nl):
                                 if ast.dump(x) != ast.dump(y):
-                                    m2 |= C.line_mask(rel, x.lineno, x.end_lineno, with_files=False)
+                                    m2 |= C.line_mask(rel, x.lineno, x.end_lineno, with_files=False, lam=True)[0]
                         if handled:
                             mask |= m2
                 if not handled:
@@ -634,14 +670,26 @@ def find_level_stmt_deep(body, line):
 
 
 def skeleton(body):
+    """Statements of a class or module body that are not functions (functions
+    are compared on their own). Imports may be reordered only inside one
+    unbroken block of imports."""
     out = []
+    run = []
     for st in body:
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            run.append(ast.dump(st))
+            continue
+        if run:
+            out.append(tuple(sorted(run)))
+            run = []
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            out.append("def %s %s %s" % (st.name, ast.dump(st.args), [ast.dump(d) for d in st.decorator_list]))
-        elif isinstance(st, ast.ClassDef):
+            continue
+        if isinstance(st, ast.ClassDef):
             out.append("class %s %s" % (st.name, [ast.dump(b) for b in st.bases]))
         else:
             out.append(ast.dump(st))
+    if run:
+        out.append(tuple(sorted(run)))
     return out
 
 
@@ -652,7 +700,72 @@ def level_equal(oi, ni, kind, q):
     b = ni.classes.get(q)
     if a is None or b is None:
         return False
-    return skeleton(a.body) == skeleton(b.body) and [ast.dump(x) for x in a.bases] == [ast.dump(x) for x in b.bases]
+    return (
+        skeleton(a.body) == skeleton(b.body)
+        and [ast.dump(x) for x in a.bases] == [ast.dump(x) for x in b.bases]
+        and [ast.dump(x) for x in a.keywords] == [ast.dump(x) for x in b.keywords]
+        and [ast.dump(x) for x in a.decorator_list] == [ast.dump(x) for x in b.decorator_list]
+    )
+
+
+def skeleton_minus(oi, ni, add_lines):
+    """Module body unchanged apart from statements made only of added lines."""
+    added = set(add_lines)
+    kept = [st for st in ni.tree.body if not (set(range(stmt_start(st), st.end_lineno + 1)) <= added)]
+    if len(kept) != len(oi.tree.body):
+        return False
+    return [ast.dump(x) for x in kept] == [ast.dump(x) for x in oi.tree.body]
+
+
+def unused_additions(C, rel, old_text, ni, add_lines):
+    """True when the added module-level statements only bind names the module
+    never mentions: a stdlib import, a literal constant, or a plain function.
+    Nothing can look such a name up, so nothing changes."""
+    mod = C.M["modof"].get(rel)
+    if mod is None or mod in C.M.get("star", ()):
+        return False
+    idents = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", old_text))
+    added = set(add_lines)
+    found = False
+    for st in ni.tree.body:
+        lines = set(range(stmt_start(st), st.end_lineno + 1))
+        if not (lines & added):
+            continue
+        if not lines <= added:
+            return False
+        names = []
+        if isinstance(st, ast.Import):
+            for al in st.names:
+                if al.name.split(".")[0] not in sys.stdlib_module_names:
+                    return False
+                names.append((al.asname or al.name).split(".")[0])
+        elif isinstance(st, ast.ImportFrom):
+            if st.level or (st.module or "").split(".")[0] not in sys.stdlib_module_names or st.module == "__future__":
+                return False
+            for al in st.names:
+                if al.name == "*":
+                    return False
+                names.append(al.asname or al.name)
+        elif isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            try:
+                ast.literal_eval(st.value)
+            except Exception:
+                return False
+            names.append(st.targets[0].id)
+        elif isinstance(st, ast.FunctionDef) and not st.decorator_list:
+            for dflt in list(st.args.defaults) + [d for d in st.args.kw_defaults if d is not None]:
+                try:
+                    ast.literal_eval(dflt)
+                except Exception:
+                    return False
+            names.append(st.name)
+        else:
+            return False
+        for nme in names:
+            if nme in idents or nme.startswith("__") or nme.startswith("test"):
+                return False
+        found = True
+    return found
 
 
 def analyze_file(C, fd):
@@ -677,7 +790,15 @@ def analyze_file(C, fd):
         if fd["new_file"]:
             if rel.startswith("tests/"):
                 return C.ALL if base == "__init__.py" else 0
-            return C.ALL
+            if base == "__init__.py":
+                return C.ALL
+            # nothing imports a module that did not exist; only tests that
+            # walk the package or the dialect registry can notice it
+            m = 0
+            for i, f in enumerate(C.tfiles):
+                if f in ENUMERATING_TESTS:
+                    m |= C.tfile_mask[i]
+            return m
         if fd["deleted"]:
             imp = M["imp_files"].get(rel, 0)
             return C.files(imp) if rel.startswith("tests/") else C.ALL
